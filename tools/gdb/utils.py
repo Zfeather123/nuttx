@@ -81,6 +81,132 @@ class ContainerOf(gdb.Function):
 ContainerOf()
 
 
+def gdb_eval_or_none(expresssion):
+    """Evaluate an expression and return None if it fails"""
+    try:
+        return gdb.parse_and_eval(expresssion)
+    except gdb.error:
+        return None
+
+
+def get_symbol_value(name, locspec="nx_start", cacheable=True):
+    """Return the value of a symbol value etc: Variable, Marco"""
+    global g_symbol_cache
+
+    # If there is a current stack frame, GDB uses the macros in scope at that frame’s source code line.
+    # Otherwise, GDB uses the macros in scope at the current listing location.
+    # Reference: https://sourceware.org/gdb/current/onlinedocs/gdb.html/Macros.html#Macros
+    try:
+        if not gdb.selected_frame():
+            gdb.execute(f"list {locspec}", to_string=True)
+            return gdb_eval_or_none(name)
+    except gdb.error:
+        pass
+
+    # Try current frame
+    value = gdb_eval_or_none(name)
+    if value:
+        return value
+
+    # Check if the symbol is already cached
+    if cacheable and (name, locspec) in g_symbol_cache:
+        return g_symbol_cache[(name, locspec)]
+
+    # There's current frame and no definition found. We need second inferior without a valid frame
+    # in order to use the list command to set the scope.
+    if len(gdb.inferiors()) == 1:
+        gdb.execute(
+            f"add-inferior -exec {gdb.objfiles()[0].filename} -no-connection",
+            to_string=True,
+        )
+        g_symbol_cache = {}
+
+    suppressed = "is on" in gdb.execute(
+        "show suppress-cli-notifications", to_string=True
+    )
+    if not suppressed:
+        # Disable notifications
+        gdb.execute("set suppress-cli-notifications on")
+
+    # Switch to inferior 2 and set the scope firstly
+    gdb.execute("inferior 2", to_string=True)
+    gdb.execute(f"list {locspec}", to_string=True)
+    value = gdb_eval_or_none(name)
+    if cacheable:
+        g_symbol_cache[(name, locspec)] = value
+
+    # Switch back to inferior 1
+    gdb.execute("inferior 1", to_string=True)
+
+    if not suppressed:
+        gdb.execute("set suppress-cli-notifications off")
+    return value
+
+
+def hexdump(address, size):
+    inf = gdb.inferiors()[0]
+    mem = inf.read_memory(address, size)
+    bytes = mem.tobytes()
+    for i in range(0, len(bytes), 16):
+        chunk = bytes[i : i + 16]
+        gdb.write(f"{i + address:08x}  ")
+        hex_values = " ".join(f"{byte:02x}" for byte in chunk)
+        hex_display = f"{hex_values:<47}"
+        gdb.write(hex_display)
+        ascii_values = "".join(
+            chr(byte) if 32 <= byte <= 126 else "." for byte in chunk
+        )
+        gdb.write(f"  {ascii_values} \n")
+
+
+def is_decimal(s):
+    return re.fullmatch(r"\d+", s) is not None
+
+
+def is_hexadecimal(s):
+    return re.fullmatch(r"0[xX][0-9a-fA-F]+|[0-9a-fA-F]+", s) is not None
+
+
+class Hexdump(gdb.Command):
+    """hexdump address/symbol <size>"""
+
+    def __init__(self):
+        super(Hexdump, self).__init__("hexdump", gdb.COMMAND_USER)
+
+    def invoke(self, args, from_tty):
+        argv = args.split(" ")
+        address = 0
+        size = 0
+        if argv[0] == "":
+            gdb.write("Usage: hexdump address/symbol <size>\n")
+            return
+
+        if is_decimal(argv[0]) or is_hexadecimal(argv[0]):
+            address = int(argv[0], 0)
+            size = int(argv[1], 0)
+        else:
+            var = gdb.parse_and_eval(f"{argv[0]}")
+            address = int(var.address)
+            size = int(var.type.sizeof)
+            gdb.write(f"{argv[0]} {hex(address)} {int(size)}\n")
+
+        hexdump(address, size)
+
+
+Hexdump()
+
+
+def nitems(array):
+    array_type = array.type
+    element_type = array_type.target()
+    element_size = element_type.sizeof
+    array_size = array_type.sizeof // element_size
+    return array_size
+
+
+# Machine Specific Helper Functions
+
+
 BIG_ENDIAN = 0
 LITTLE_ENDIAN = 1
 target_endianness = None
